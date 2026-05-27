@@ -1,4 +1,4 @@
-Portable Software Audit Utility - Installed Apps Only
+Portable Software Audit Utility
 =====================================================================
 
 It keeps the reference workbook color behavior as the default formatting, with the updated green audit fill requested by the user:
@@ -53,4 +53,3 @@ Requirements
 - Windows PC
 - Microsoft Excel installed
 - PowerShell 5.1 or later
-- No administrator rights required for normal use
