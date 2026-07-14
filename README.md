@@ -120,7 +120,9 @@ Company-specific required services can be added near the top of `SoftwareAudit.p
 Compliance:
 
 - Rollup of important device, security, and service checks
-- Dynamic overall compliance summary
+- Overall compliance percentage based only on nonblank auditor criteria in column B
+- Red below 85%, yellow from 85% through 99%, and green only at 100%
+- Exact criteria must match; `% Space Available` is treated as a minimum threshold
 - Disk-space percentage (linked to the Device sheet), pending reboot, TPM, Secure Boot, BitLocker, Defender, firewall, UAC, SMBv1, antivirus, and required-service status
 - Enabled local users, disabled local users, and Local Administrators members
 

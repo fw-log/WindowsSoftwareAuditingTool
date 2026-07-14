@@ -1030,6 +1030,37 @@ function Get-AuditRowByName {
     return $null
 }
 
+function Test-AuditorCriterion {
+    param(
+        [string]$Name,
+        [string]$Expected,
+        [string]$Value
+    )
+    if ([string]::IsNullOrWhiteSpace($Expected)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Name -eq '% Space Available') {
+        $expectedNumber = 0.0
+        $valueNumber = 0.0
+        $expectedParsed = [double]::TryParse(($Expected -replace '[^0-9.\-]', ''), [ref]$expectedNumber)
+        $valueParsed = [double]::TryParse(($Value -replace '[^0-9.\-]', ''), [ref]$valueNumber)
+        return ($expectedParsed -and $valueParsed -and $valueNumber -ge $expectedNumber)
+    }
+    return $Expected.Trim().Equals($Value.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-CompliancePercentage {
+    param([array]$Rows)
+    $expectationCount = 0
+    $passCount = 0
+    foreach ($row in @($Rows)) {
+        if ($row.Name -eq 'Overall compliance summary' -or [string]::IsNullOrWhiteSpace($row.Expected)) { continue }
+        $expectationCount++
+        if (Test-AuditorCriterion -Name $row.Name -Expected $row.Expected -Value $row.Value) { $passCount++ }
+    }
+    if ($expectationCount -eq 0) { return 0.0 }
+    return [Math]::Round(($passCount / [double]$expectationCount) * 100, 2)
+}
+
 function Get-ComplianceAuditRows {
     param([array]$DeviceRows, [array]$SecurityRows, [array]$ServiceRows, [array]$UserRows = @())
     $rows = @()
@@ -1041,17 +1072,16 @@ function Get-ComplianceAuditRows {
         $row = Get-AuditRowByName -Rows $SecurityRows -Name $name
         if ($row) { $rows += New-AuditRow -Name $name -Expected ($row.Expected) -Value ($row.Value) -Status ($row.Status) -Comment ($row.Comment) }
     }
-    foreach ($row in @($ServiceRows | Where-Object { $_.Expected -eq 'Installed and running' -or $_.Status -in @('Fail','Warning') })) {
+    foreach ($row in @($ServiceRows | Where-Object { $_.Expected -eq 'Installed and running' })) {
         $rows += New-AuditRow -Name ($row.Name) -Expected ($row.Expected) -Value ($row.Value) -Status ($row.Status) -Comment ($row.Comment)
     }
     foreach ($name in @('Enabled local users', 'Disabled local users', 'Local Administrators members')) {
         $row = Get-AuditRowByName -Rows $UserRows -Name $name
         if ($row) { $rows += New-AuditRow -Name $name -Expected ($row.Expected) -Value ($row.Value) -Status ($row.Status) -Comment ($row.Comment) }
     }
-    $failCount = @($rows | Where-Object { $_.Status -eq 'Fail' }).Count
-    $warningCount = @($rows | Where-Object { $_.Status -eq 'Warning' }).Count
-    $overallStatus = if ($failCount -gt 0) { 'Fail' } elseif ($warningCount -gt 0) { 'Warning' } else { 'Pass' }
-    $rows = @(New-AuditRow -Name 'Overall compliance summary' -Expected 'No failures or warnings' -Value ("Failures: {0}; Warnings: {1}" -f $failCount, $warningCount) -Status $overallStatus) + $rows
+    $percentage = Get-CompliancePercentage -Rows $rows
+    $overallStatus = if ($percentage -ge 100) { 'Pass' } elseif ($percentage -lt 85) { 'Fail' } else { 'Warning' }
+    $rows = @(New-AuditRow -Name 'Overall compliance summary' -Expected '100%' -Value ("{0}%" -f $percentage) -Status $overallStatus -Comment 'Percentage of nonblank auditor criteria passed.') + $rows
     return $rows
 }
 
@@ -1244,13 +1274,28 @@ function Set-DynamicAuditConditionalFormatting {
     param($Sheet)
     $lastRow = [Math]::Max(1, (Get-UsedLastRow $Sheet))
     $lastCol = [Math]::Max(2, (Get-UsedLastCol $Sheet))
-    if ($lastRow -lt 2 -or $lastCol -lt 3) { return }
+    $firstDataRow = 2
+    $isCompliance = ($Sheet.Name -eq 'Compliance' -and $Sheet.Cells.Item(2,1).Text.Trim() -eq 'Overall compliance summary')
+    if ($isCompliance) {
+        $firstDataRow = 3
+    }
+    if ($lastRow -lt $firstDataRow -or $lastCol -lt 3) { return }
     try {
-        $range = $Sheet.Range($Sheet.Cells.Item(2,3), $Sheet.Cells.Item($lastRow,$lastCol))
+        $range = $Sheet.Range($Sheet.Cells.Item($firstDataRow,3), $Sheet.Cells.Item($lastRow,$lastCol))
         $range.FormatConditions.Delete()
-        $redFormula = '=OR(LOWER(TRIM(C2))="(not detected)",LOWER(TRIM(C2))="unavailable",LOWER(TRIM(C2))="missing")'
-        $greenFormula = '=AND(C2<>"",IF($A2="% Space Available",IFERROR(VALUE(SUBSTITUTE(C2,"%",""))>=VALUE(SUBSTITUTE($B2,"%","")),FALSE),LOWER(TRIM(C2))=LOWER(TRIM($B2))))'
-        $yellowFormula = '=AND(C2<>"",NOT(OR(LOWER(TRIM(C2))="(not detected)",LOWER(TRIM(C2))="unavailable",LOWER(TRIM(C2))="missing")),IF($A2="% Space Available",IFERROR(VALUE(SUBSTITUTE(C2,"%",""))<VALUE(SUBSTITUTE($B2,"%","")),TRUE),LOWER(TRIM(C2))<>LOWER(TRIM($B2))))'
+        $firstCell = "C$firstDataRow"
+        $itemCell = "`$A$firstDataRow"
+        $criterionCell = "`$B$firstDataRow"
+        $criterionGuard = if ($isCompliance) { $criterionCell + '<>""' } else { 'TRUE' }
+        if ($isCompliance) {
+            $notEvaluatedFormula = '=' + $criterionCell + '=""'
+            $notEvaluatedRule = $range.FormatConditions.Add(2, $null, $notEvaluatedFormula)
+            $notEvaluatedRule.Interior.Color = $SectionGrayColor
+            $notEvaluatedRule.StopIfTrue = $true
+        }
+        $redFormula = '=AND({0},OR(LOWER(TRIM({1}))="(not detected)",LOWER(TRIM({1}))="unavailable",LOWER(TRIM({1}))="missing"))' -f $criterionGuard, $firstCell
+        $greenFormula = '=AND({0},{1}<>"",IF({2}="% Space Available",IFERROR(VALUE(SUBSTITUTE({1},"%",""))>=VALUE(SUBSTITUTE({3},"%","")),FALSE),LOWER(TRIM({1}))=LOWER(TRIM({3}))))' -f $criterionGuard, $firstCell, $itemCell, $criterionCell
+        $yellowFormula = '=AND({0},{1}<>"",NOT(OR(LOWER(TRIM({1}))="(not detected)",LOWER(TRIM({1}))="unavailable",LOWER(TRIM({1}))="missing")),IF({2}="% Space Available",IFERROR(VALUE(SUBSTITUTE({1},"%",""))<VALUE(SUBSTITUTE({3},"%","")),TRUE),LOWER(TRIM({1}))<>LOWER(TRIM({3}))))' -f $criterionGuard, $firstCell, $itemCell, $criterionCell
         $redRule = $range.FormatConditions.Add(2, $null, $redFormula)
         $redRule.Interior.Color = $OriginalRedColor
         $redRule.StopIfTrue = $true
@@ -1440,6 +1485,7 @@ function Set-AuditCellResult {
         'Missing' { $OriginalRedColor; break }
         'Warning' { $OriginalYellowColor; break }
         'Different' { $OriginalYellowColor; break }
+        'NotEvaluated' { $SectionGrayColor; break }
         default { $OriginalGreenColor }
     }
     Set-FillColor -RangeOrCell $Cell -Color $color
@@ -1770,28 +1816,43 @@ function Set-DynamicComplianceSummary {
         if ($sheet.Cells.Item($r,1).Text.Trim() -eq 'Overall compliance summary') { $summaryRow = $r; break }
     }
     if ($summaryRow -ne 2 -or $lastRow -lt 3) { return }
-    $sheet.Cells.Item($summaryRow,2).Value2 = 'Compliant'
+    $targetCell = $sheet.Cells.Item($summaryRow,2)
+    $targetCell.NumberFormat = '0%'
+    $targetCell.Value2 = 1
     $lastCol = [Math]::Max(2, (Get-UsedLastCol $sheet))
     for ($c = 3; $c -le $lastCol; $c++) {
         if ([string]::IsNullOrWhiteSpace($sheet.Cells.Item(1,$c).Text)) { continue }
-        $differenceChecks = @()
+        $passChecks = @()
         for ($r = 3; $r -le $lastRow; $r++) {
             if ([string]::IsNullOrWhiteSpace($sheet.Cells.Item($r,1).Text)) { continue }
             if ($sheet.Cells.Item($r,1).Text.Trim() -eq '% Space Available') {
-                $differenceChecks += ('AND(R{0}C{1}<>"",IFERROR(VALUE(SUBSTITUTE(R{0}C{1},"%",""))<VALUE(SUBSTITUTE(R{0}C2,"%","")),TRUE))' -f $r, $c)
+                $passChecks += ('IF(AND(R{0}C2<>"",R{0}C{1}<>"",IFERROR(VALUE(SUBSTITUTE(R{0}C{1},"%",""))>=VALUE(SUBSTITUTE(R{0}C2,"%","")),FALSE)),1,0)' -f $r, $c)
             } else {
-                $differenceChecks += ('AND(R{0}C{1}<>"",LOWER(TRIM(R{0}C{1}))<>LOWER(TRIM(R{0}C2)))' -f $r, $c)
+                $passChecks += ('IF(AND(R{0}C2<>"",R{0}C{1}<>"",LOWER(TRIM(R{0}C{1}&""))=LOWER(TRIM(R{0}C2&""))),1,0)' -f $r, $c)
             }
         }
         $summaryCell = $sheet.Cells.Item($summaryRow,$c)
-        $summaryCell.NumberFormat = 'General'
-        if ($differenceChecks.Count -eq 0) {
-            $summaryCell.Value2 = 'Compliant'
+        $summaryCell.NumberFormat = '0%'
+        if ($passChecks.Count -eq 0) {
+            $summaryCell.Value2 = 0
         } else {
-            # R1C1 avoids Excel interpreting an A1 reference such as C1 as an
-            # invalid name, and avoids the array formula used by older versions.
-            $summaryCell.FormulaR1C1 = '=IF(OR({0}),"Review differences","Compliant")' -f ($differenceChecks -join ',')
+            $summaryCell.FormulaR1C1 = '=IFERROR(({0})/COUNTIF(R3C2:R{1}C2,"<>"),0)' -f ($passChecks -join '+'), $lastRow
         }
+    }
+    if ($lastCol -ge 3) {
+        $summaryRange = $sheet.Range($sheet.Cells.Item($summaryRow,3), $sheet.Cells.Item($summaryRow,$lastCol))
+        $summaryRange.FormatConditions.Delete()
+        $summaryRange.Font.Bold = $true
+        $firstSummaryCell = '{0}{1}' -f (Get-ExcelColumnName -ColumnNumber 3), $summaryRow
+        $redRule = $summaryRange.FormatConditions.Add(2, $null, ('=AND({0}<>"",{0}<85%)' -f $firstSummaryCell))
+        $redRule.Interior.Color = $OriginalRedColor
+        $redRule.StopIfTrue = $true
+        $greenRule = $summaryRange.FormatConditions.Add(2, $null, ('={0}=100%' -f $firstSummaryCell))
+        $greenRule.Interior.Color = $OriginalGreenColor
+        $greenRule.StopIfTrue = $true
+        $yellowRule = $summaryRange.FormatConditions.Add(2, $null, ('=AND({0}>=85%,{0}<100%)' -f $firstSummaryCell))
+        $yellowRule.Interior.Color = $OriginalYellowColor
+        $yellowRule.StopIfTrue = $true
     }
     Format-AuditSheetColumns -Sheet $sheet
 }
@@ -1980,6 +2041,7 @@ function Invoke-AuditWorkbook {
         $softwareSame = @($softwareRows | Where-Object { $_.Status -eq 'Pass' }).Count
         $softwareMissing = @($softwareRows | Where-Object { $_.Status -eq 'Fail' }).Count
         $softwareDifferent = @($softwareRows | Where-Object { $_.Status -eq 'Warning' }).Count
+        $compliancePercentage = Get-CompliancePercentage -Rows $complianceRows
         $complianceFailures = @($complianceRows | Where-Object { $_.Status -eq 'Fail' }).Count
         $complianceWarnings = @($complianceRows | Where-Object { $_.Status -eq 'Warning' }).Count
 
@@ -1995,8 +2057,7 @@ function Invoke-AuditWorkbook {
         Write-Host "Same version: $softwareSame"
         Write-Host "Missing software: $softwareMissing"
         Write-Host "Different / version unavailable: $softwareDifferent"
-        Write-Host "Compliance failures: $complianceFailures"
-        Write-Host "Compliance warnings: $complianceWarnings"
+        Write-Host "Compliance: $compliancePercentage%"
         Write-Host "Workbook updated: $path"
         Write-Host "Backup saved: $backupPath"
         return [PSCustomObject]@{
@@ -2012,6 +2073,7 @@ function Invoke-AuditWorkbook {
             SoftwareSame       = $softwareSame
             SoftwareMissing    = $softwareMissing
             SoftwareDifferent  = $softwareDifferent
+            CompliancePercentage = $compliancePercentage
             ComplianceFailures = $complianceFailures
             ComplianceWarnings = $complianceWarnings
         }
@@ -2068,6 +2130,37 @@ function Get-CategoryRowsFromWorkbookBaseline {
     $sheet = Get-OrCreateWorksheet -Workbook $Workbook -Name $SheetName
     $baseline = Get-SheetBaselineMap -Sheet $sheet
     return @(Get-ComparisonRowsFromBaseline -CurrentRows $CurrentRows -BaselineMap $baseline)
+}
+
+function Get-ComplianceRowsFromAuditorCriteria {
+    param($Workbook, [array]$CurrentRows)
+    $sheet = Get-OrCreateWorksheet -Workbook $Workbook -Name 'Compliance'
+    $criteria = Get-SheetBaselineMap -Sheet $sheet
+    $rows = @()
+    $seen = @{}
+    foreach ($row in @($CurrentRows)) {
+        $seen[$row.Name] = $true
+        $expected = if ($criteria.ContainsKey($row.Name)) { [string]$criteria[$row.Name] } else { '' }
+        if ([string]::IsNullOrWhiteSpace($expected)) {
+            $status = 'NotEvaluated'
+        } elseif (Test-AuditorCriterion -Name $row.Name -Expected $expected -Value $row.Value) {
+            $status = 'Pass'
+        } else {
+            $status = 'Warning'
+        }
+        $comment = $row.Comment
+        if (-not $criteria.ContainsKey($row.Name)) {
+            $comment = "No auditor criterion is set for this item.`n$comment"
+        }
+        $rows += New-AuditRow -Name ($row.Name) -Expected $expected -Value ($row.Value) -Status $status -Comment $comment
+    }
+    foreach ($name in @($criteria.Keys | Sort-Object)) {
+        if ($seen.ContainsKey($name)) { continue }
+        $expected = [string]$criteria[$name]
+        $status = if ([string]::IsNullOrWhiteSpace($expected)) { 'NotEvaluated' } else { 'Fail' }
+        $rows += New-AuditRow -Name $name -Expected $expected -Value '(not detected)' -Status $status -Comment 'This auditor criterion could not be evaluated because the item was not detected.'
+    }
+    return $rows
 }
 
 function Invoke-StreamlinedDeviceAudit {
@@ -2159,7 +2252,7 @@ function Invoke-StreamlinedDeviceAudit {
             $securityRows = @(Get-CategoryRowsFromWorkbookBaseline -Workbook $workbook -SheetName 'Security' -CurrentRows $securityRowsRaw)
             $networkRows = @(Get-CategoryRowsFromWorkbookBaseline -Workbook $workbook -SheetName 'Network' -CurrentRows $networkRowsRaw)
             $serviceRows = @(Get-CategoryRowsFromWorkbookBaseline -Workbook $workbook -SheetName 'Services' -CurrentRows $serviceRowsRaw)
-            $complianceRows = @(Get-CategoryRowsFromWorkbookBaseline -Workbook $workbook -SheetName 'Compliance' -CurrentRows $complianceRowsRaw)
+            $complianceRows = @(Get-ComplianceRowsFromAuditorCriteria -Workbook $workbook -CurrentRows $complianceRowsRaw)
         }
 
         Write-AlignedAuditRows -Workbook $workbook -SheetName 'Software' -Rows $softwareRows -Asset $asset -AssetColumn $assetColumn -BaselineMode:$baselineMode -FirstHeader 'Software' -SecondHeader 'Baseline Version'
@@ -2178,6 +2271,7 @@ function Invoke-StreamlinedDeviceAudit {
 
         Write-TroubleshootingLog -Category 'Excel' -Message 'All audit worksheets updated; saving workbook.'
         $workbook.Save()
+        $compliancePercentage = Get-CompliancePercentage -Rows $complianceRows
         $summary = [PSCustomObject]@{
             WorkbookPath = $WorkbookPath
             BackupPath = $backupPath
@@ -2189,10 +2283,11 @@ function Invoke-StreamlinedDeviceAudit {
             SoftwareCount = $softwareRows.Count
             DeviceCount = $deviceRows.Count
             SecurityCount = $securityRows.Count
+            CompliancePercentage = $compliancePercentage
             ComplianceFailures = @($complianceRows | Where-Object { $_.Status -eq 'Fail' }).Count
             ComplianceWarnings = @($complianceRows | Where-Object { $_.Status -eq 'Warning' }).Count
         }
-        Write-TroubleshootingLog -Category 'Audit' -Message ("Audit completed. Asset column: {0}; Software rows: {1}; Compliance failures: {2}; Compliance warnings: {3}" -f $summary.AssetColumn, $summary.SoftwareCount, $summary.ComplianceFailures, $summary.ComplianceWarnings)
+        Write-TroubleshootingLog -Category 'Audit' -Message ("Audit completed. Asset column: {0}; Software rows: {1}; Compliance: {2}%" -f $summary.AssetColumn, $summary.SoftwareCount, $summary.CompliancePercentage)
         return $summary
     } catch {
         Write-TroubleshootingException -ErrorRecord $_ -Context ("Audit failed for workbook '{0}'" -f $WorkbookPath)
@@ -2462,7 +2557,7 @@ function Show-AuditGui {
             if ($summary.UsedBlankReferenceSheet) { Add-GuiLog -TextBox $logText -Message "Blank source sheet was accepted because a new sheet set was created." }
             Add-GuiLog -TextBox $logText -Message "Software rows: $($summary.SoftwareRows), same: $($summary.SoftwareSame), missing: $($summary.SoftwareMissing), different: $($summary.SoftwareDifferent)."
             if ($summary.SoftwareAuditMode -eq 'InDepth') { Add-GuiLog -TextBox $logText -Message "Software inventory rows: $($summary.SoftwareInventoryRows)." }
-            Add-GuiLog -TextBox $logText -Message "Compliance failures: $($summary.ComplianceFailures), warnings: $($summary.ComplianceWarnings)."
+            Add-GuiLog -TextBox $logText -Message "Compliance: $($summary.CompliancePercentage)% of auditor criteria passed."
             Add-GuiLog -TextBox $logText -Message "Backup saved: $($summary.BackupPath)"
             [System.Windows.Forms.MessageBox]::Show("Audit complete.`n`nWorkbook updated:`n$($summary.WorkbookPath)`n`nBackup saved:`n$($summary.BackupPath)", "Audit Complete", "OK", "Information") | Out-Null
         } catch {
@@ -2525,8 +2620,7 @@ function Invoke-StreamlinedConsoleMain {
     Write-Host "Workbook: $($summary.WorkbookPath)"
     Write-Host "Asset: $($summary.Asset)"
     Write-Host "Asset column: $($summary.AssetColumn)"
-    Write-Host "Compliance failures: $($summary.ComplianceFailures)"
-    Write-Host "Compliance warnings: $($summary.ComplianceWarnings)"
+    Write-Host "Compliance: $($summary.CompliancePercentage)%"
 }
 
 function Show-StreamlinedAuditGui {
@@ -2597,7 +2691,7 @@ function Show-StreamlinedAuditGui {
         & $writeLog "Audit complete."
         & $writeLog "Workbook: $($Summary.WorkbookPath)"
         & $writeLog "Asset: $($Summary.Asset), column $($Summary.AssetColumn)"
-        & $writeLog "Software rows: $($Summary.SoftwareCount); compliance failures: $($Summary.ComplianceFailures); warnings: $($Summary.ComplianceWarnings)"
+        & $writeLog "Software rows: $($Summary.SoftwareCount); compliance: $($Summary.CompliancePercentage)%"
         & $writeLog "Troubleshooting log: $script:TroubleshootingLogPath"
         $backupText = if ([string]::IsNullOrWhiteSpace($Summary.BackupPath)) { '' } else { "`n`nBackup:`n$($Summary.BackupPath)" }
         [System.Windows.Forms.MessageBox]::Show("Audit complete.`n`nWorkbook:`n$($Summary.WorkbookPath)`n`nAsset: $($Summary.Asset)$backupText", 'Audit Complete', 'OK', 'Information') | Out-Null
