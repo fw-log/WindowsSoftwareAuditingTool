@@ -1,0 +1,12 @@
+# Local agent/project context
+/CONTEXT.md
+
+# Runtime output
+/Backups/
+/Exports/
+/Audits/
+/Logs/
+
+# Office temporary lock files
+.~lock.*#
+~$*
