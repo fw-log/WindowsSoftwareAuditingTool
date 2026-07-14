@@ -45,7 +45,7 @@ For each device:
 - Differences from baseline, new software, or review items are marked yellow.
 - Comments contain supporting details where available.
 
-Changing an editable value in column B immediately recalculates the device-cell colors through Excel conditional formatting. True/False and Yes/No baselines use dropdown validation so only supported values can be entered.
+Changing an editable value in column B immediately recalculates the device-cell colors through Excel conditional formatting. Criteria with only two or three supported values use dropdown validation.
 
 `% Space Available` is maintained on the Device sheet; the corresponding Compliance row links to it so both sheets always show the same baseline and audited values.
 
@@ -122,7 +122,9 @@ Compliance:
 - Rollup of important device, security, and service checks
 - Overall compliance percentage based only on nonblank auditor criteria in column B
 - Red below 85%, yellow from 85% through 99%, and green only at 100%
-- Exact criteria must match; `% Space Available` is treated as a minimum threshold
+- Individual checks are green when the detected value exactly matches the criterion and red otherwise
+- `% Space Available` remains a minimum threshold and uses yellow when it falls below the criterion
+- Blank criteria are excluded from scoring and shown in grey
 - Disk-space percentage (linked to the Device sheet), pending reboot, TPM, Secure Boot, BitLocker, Defender, firewall, UAC, SMBv1, antivirus, and required-service status
 - Enabled local users, disabled local users, and Local Administrators members
 

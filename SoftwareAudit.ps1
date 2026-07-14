@@ -32,6 +32,18 @@ $FilterWindowsDefaultsAndFrameworks = $true
 # Example: @{ Name = 'YourAgentServiceName'; Display = 'Your Agent'; Required = $true }
 $RequiredCompanyServices = @()
 
+# Criteria with a fixed, small set of values use Excel dropdown validation.
+$LimitedAuditOptions = @{
+    'Domain joined' = @('True', 'False')
+    'Pending reboot' = @('True', 'False')
+    'Secure Boot' = @('True', 'False', 'Unavailable or legacy BIOS')
+    'Defender antivirus enabled' = @('True', 'False')
+    'Defender real-time protection' = @('True', 'False')
+    'UAC enabled' = @('True', 'False', 'Unavailable')
+    'Remote Desktop enabled' = @('True', 'False', 'Unavailable')
+    'SMBv1 enabled' = @('True', 'False', 'Unavailable')
+}
+
 $script:TroubleshootingLogPath = ''
 
 function Initialize-TroubleshootingLog {
@@ -1251,12 +1263,14 @@ function Set-BaselineValidation {
     for ($r = 2; $r -le $lastRow; $r++) {
         $cell = $Sheet.Cells.Item($r,2)
         try { $cell.Validation.Delete() } catch {}
-        if ($Sheet.Cells.Item($r,1).Text.Trim() -eq 'Additional Software') { continue }
+        $itemName = $Sheet.Cells.Item($r,1).Text.Trim()
+        if ($itemName -eq 'Additional Software') { continue }
         $values = @($cell.Text.Trim())
         for ($c = 3; $c -le $lastCol; $c++) { $values += $Sheet.Cells.Item($r,$c).Text.Trim() }
         $normalized = @($values | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.ToLowerInvariant() })
         $options = ''
-        if (@($normalized | Where-Object { $_ -in @('true','false') }).Count -gt 0) { $options = 'True,False' }
+        if ($LimitedAuditOptions.ContainsKey($itemName)) { $options = $LimitedAuditOptions[$itemName] -join ',' }
+        elseif (@($normalized | Where-Object { $_ -in @('true','false') }).Count -gt 0) { $options = 'True,False' }
         elseif (@($normalized | Where-Object { $_ -in @('yes','no') }).Count -gt 0) { $options = 'Yes,No' }
         if ([string]::IsNullOrWhiteSpace($options)) { continue }
         try {
@@ -1286,16 +1300,19 @@ function Set-DynamicAuditConditionalFormatting {
         $firstCell = "C$firstDataRow"
         $itemCell = "`$A$firstDataRow"
         $criterionCell = "`$B$firstDataRow"
-        $criterionGuard = if ($isCompliance) { $criterionCell + '<>""' } else { 'TRUE' }
         if ($isCompliance) {
             $notEvaluatedFormula = '=' + $criterionCell + '=""'
             $notEvaluatedRule = $range.FormatConditions.Add(2, $null, $notEvaluatedFormula)
             $notEvaluatedRule.Interior.Color = $SectionGrayColor
             $notEvaluatedRule.StopIfTrue = $true
+            $redFormula = '=AND({0}<>"",{1}<>"% Space Available",LOWER(TRIM({2}&""))<>LOWER(TRIM({0}&"")))' -f $criterionCell, $itemCell, $firstCell
+            $greenFormula = '=AND({0}<>"",IF({1}="% Space Available",IFERROR(VALUE(SUBSTITUTE({2},"%",""))>=VALUE(SUBSTITUTE({0},"%","")),FALSE),LOWER(TRIM({2}&""))=LOWER(TRIM({0}&""))))' -f $criterionCell, $itemCell, $firstCell
+            $yellowFormula = '=AND({0}<>"",{1}="% Space Available",IFERROR(VALUE(SUBSTITUTE({2},"%",""))<VALUE(SUBSTITUTE({0},"%","")),TRUE))' -f $criterionCell, $itemCell, $firstCell
+        } else {
+            $redFormula = '=OR(LOWER(TRIM({0}))="(not detected)",LOWER(TRIM({0}))="unavailable",LOWER(TRIM({0}))="missing")' -f $firstCell
+            $greenFormula = '=AND({0}<>"",IF({1}="% Space Available",IFERROR(VALUE(SUBSTITUTE({0},"%",""))>=VALUE(SUBSTITUTE({2},"%","")),FALSE),LOWER(TRIM({0}))=LOWER(TRIM({2}))))' -f $firstCell, $itemCell, $criterionCell
+            $yellowFormula = '=AND({0}<>"",NOT(OR(LOWER(TRIM({0}))="(not detected)",LOWER(TRIM({0}))="unavailable",LOWER(TRIM({0}))="missing")),IF({1}="% Space Available",IFERROR(VALUE(SUBSTITUTE({0},"%",""))<VALUE(SUBSTITUTE({2},"%","")),TRUE),LOWER(TRIM({0}))<>LOWER(TRIM({2}))))' -f $firstCell, $itemCell, $criterionCell
         }
-        $redFormula = '=AND({0},OR(LOWER(TRIM({1}))="(not detected)",LOWER(TRIM({1}))="unavailable",LOWER(TRIM({1}))="missing"))' -f $criterionGuard, $firstCell
-        $greenFormula = '=AND({0},{1}<>"",IF({2}="% Space Available",IFERROR(VALUE(SUBSTITUTE({1},"%",""))>=VALUE(SUBSTITUTE({3},"%","")),FALSE),LOWER(TRIM({1}))=LOWER(TRIM({3}))))' -f $criterionGuard, $firstCell, $itemCell, $criterionCell
-        $yellowFormula = '=AND({0},{1}<>"",NOT(OR(LOWER(TRIM({1}))="(not detected)",LOWER(TRIM({1}))="unavailable",LOWER(TRIM({1}))="missing")),IF({2}="% Space Available",IFERROR(VALUE(SUBSTITUTE({1},"%",""))<VALUE(SUBSTITUTE({3},"%","")),TRUE),LOWER(TRIM({1}))<>LOWER(TRIM({3}))))' -f $criterionGuard, $firstCell, $itemCell, $criterionCell
         $redRule = $range.FormatConditions.Add(2, $null, $redFormula)
         $redRule.Interior.Color = $OriginalRedColor
         $redRule.StopIfTrue = $true
@@ -2146,7 +2163,7 @@ function Get-ComplianceRowsFromAuditorCriteria {
         } elseif (Test-AuditorCriterion -Name $row.Name -Expected $expected -Value $row.Value) {
             $status = 'Pass'
         } else {
-            $status = 'Warning'
+            $status = 'Fail'
         }
         $comment = $row.Comment
         if (-not $criteria.ContainsKey($row.Name)) {
